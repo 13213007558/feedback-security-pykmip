@@ -14,6 +14,7 @@
 # under the License.
 
 from kmip.core import enums
+from kmip.core import exceptions
 from kmip.core import objects
 from kmip.core import utils
 
@@ -500,8 +501,161 @@ class BatchCount(Integer):
 
 # 6.16
 class MessageExtension(Struct):
-    def __init__(self):
+    """
+    A structure containing a vendor-specific extension to the KMIP protocol.
+
+    See Section 6.16 of the KMIP 1.1 specification for more information.
+
+    Attributes:
+        vendor_identification: A string identifying the vendor that defined
+            the extension.
+        criticality_indicator: A boolean indicating whether the extension is
+            critical and must be understood by the recipient.
+        vendor_extension: The raw bytes encoding the vendor-specific
+            extension data.
+    """
+
+    def __init__(self,
+                 vendor_identification=None,
+                 criticality_indicator=None,
+                 vendor_extension=None):
+        """
+        Construct a MessageExtension struct.
+
+        Args:
+            vendor_identification (str): A string identifying the vendor
+                that defined the extension. Optional, defaults to None.
+            criticality_indicator (bool): A boolean indicating whether the
+                extension is critical. Optional, defaults to None.
+            vendor_extension (bytes): The raw bytes encoding the
+                vendor-specific extension data. Optional, defaults to None.
+        """
         super(MessageExtension, self).__init__(enums.Tags.MESSAGE_EXTENSION)
+
+        self._vendor_identification = None
+        self._criticality_indicator = None
+        self._vendor_extension = None
+
+        self.vendor_identification = vendor_identification
+        self.criticality_indicator = criticality_indicator
+        self.vendor_extension = vendor_extension
+
+    @property
+    def vendor_identification(self):
+        if self._vendor_identification is not None:
+            return self._vendor_identification.value
+        return None
+
+    @vendor_identification.setter
+    def vendor_identification(self, value):
+        if value is None:
+            self._vendor_identification = None
+        elif isinstance(value, str):
+            self._vendor_identification = TextString(
+                value=value,
+                tag=enums.Tags.VENDOR_IDENTIFICATION
+            )
+        else:
+            raise TypeError("The vendor identification must be a string.")
+
+    @property
+    def criticality_indicator(self):
+        if self._criticality_indicator is not None:
+            return self._criticality_indicator.value
+        return None
+
+    @criticality_indicator.setter
+    def criticality_indicator(self, value):
+        if value is None:
+            self._criticality_indicator = None
+        elif isinstance(value, bool):
+            self._criticality_indicator = Boolean(
+                value=value,
+                tag=enums.Tags.CRITICALITY_INDICATOR
+            )
+        else:
+            raise TypeError("The criticality indicator must be a boolean.")
+
+    @property
+    def vendor_extension(self):
+        return self._vendor_extension
+
+    @vendor_extension.setter
+    def vendor_extension(self, value):
+        if value is None:
+            self._vendor_extension = None
+        elif isinstance(value, bytes):
+            self._vendor_extension = value
+        else:
+            raise TypeError(
+                "The vendor extension must be a binary string."
+            )
+
+    def read(self, istream, kmip_version=enums.KMIPVersion.KMIP_1_0):
+        """
+        Read the data encoding the MessageExtension object and decode it
+        into its constituent parts.
+
+        Args:
+            istream (Stream): A data stream containing encoded object data,
+                supporting a read method; usually a BytearrayStream object.
+            kmip_version (KMIPVersion): An enumeration defining the KMIP
+                version with which the object will be decoded. Optional,
+                defaults to KMIP 1.0.
+        """
+        super(MessageExtension, self).read(istream, kmip_version=kmip_version)
+        tstream = utils.BytearrayStream(istream.read(self.length))
+
+        self._vendor_identification = TextString(
+            tag=enums.Tags.VENDOR_IDENTIFICATION
+        )
+        self._vendor_identification.read(tstream, kmip_version=kmip_version)
+
+        if not self.is_tag_next(enums.Tags.CRITICALITY_INDICATOR, tstream):
+            raise exceptions.InvalidMessage(
+                "The message extension is missing its criticality "
+                "indicator."
+            )
+
+        self._criticality_indicator = Boolean(
+            tag=enums.Tags.CRITICALITY_INDICATOR
+        )
+        self._criticality_indicator.read(tstream, kmip_version=kmip_version)
+
+        self._vendor_extension = tstream.read()
+
+        self.is_oversized(tstream)
+
+    def write(self, ostream, kmip_version=enums.KMIPVersion.KMIP_1_0):
+        """
+        Write the data encoding the MessageExtension object to a stream.
+
+        Args:
+            ostream (Stream): A data stream in which to encode object data,
+                supporting a write method; usually a BytearrayStream object.
+            kmip_version (KMIPVersion): An enumeration defining the KMIP
+                version with which the object will be encoded. Optional,
+                defaults to KMIP 1.0.
+        """
+        tstream = utils.BytearrayStream()
+
+        if self._vendor_identification is None:
+            raise exceptions.InvalidMessage(
+                "The message extension is missing its vendor identification."
+            )
+        if self._criticality_indicator is None:
+            raise exceptions.InvalidMessage(
+                "The message extension is missing its criticality indicator."
+            )
+
+        self._vendor_identification.write(tstream, kmip_version=kmip_version)
+        self._criticality_indicator.write(tstream, kmip_version=kmip_version)
+        if self._vendor_extension is not None:
+            tstream.write(self._vendor_extension)
+
+        self.length = tstream.length()
+        super(MessageExtension, self).write(ostream, kmip_version=kmip_version)
+        ostream.write(tstream.buffer)
 
 
 # 6.19

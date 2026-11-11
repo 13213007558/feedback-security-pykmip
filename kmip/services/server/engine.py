@@ -376,38 +376,44 @@ class KmipEngine(object):
                             "Batch item ID is undefined."
                         )
 
-                # Process batch message extension.
-                # TODO (peterhamilton) Add support for message extension handling.
-                # 1. Extract the vendor identification and criticality indicator.
-                # 2. If the indicator is True, raise an error.
-                # 3. If the indicator is False, ignore the extension.
-
-                # Process batch payload.
+                # Process batch message extensions.
                 try:
-                    response_payload = self._process_operation(
-                        operation.value,
-                        request_payload
+                    self._process_message_extensions(
+                        batch_item.message_extensions
                     )
-
-                    result_status = enums.ResultStatus.SUCCESS
                 except exceptions.KmipError as e:
                     error_occurred = True
                     result_status = e.status
                     result_reason = e.reason
                     result_message = str(e)
-                except Exception as e:
-                    self._logger.warning(
-                        "Error occurred while processing operation."
-                    )
-                    self._logger.exception(e)
 
-                    error_occurred = True
-                    result_status = enums.ResultStatus.OPERATION_FAILED
-                    result_reason = enums.ResultReason.GENERAL_FAILURE
-                    result_message = (
-                        "Operation failed. See the server logs for more "
-                        "information."
-                    )
+                # Process batch payload.
+                if not error_occurred:
+                    try:
+                        response_payload = self._process_operation(
+                            operation.value,
+                            request_payload
+                        )
+
+                        result_status = enums.ResultStatus.SUCCESS
+                    except exceptions.KmipError as e:
+                        error_occurred = True
+                        result_status = e.status
+                        result_reason = e.reason
+                        result_message = str(e)
+                    except Exception as e:
+                        self._logger.warning(
+                            "Error occurred while processing operation."
+                        )
+                        self._logger.exception(e)
+
+                        error_occurred = True
+                        result_status = enums.ResultStatus.OPERATION_FAILED
+                        result_reason = enums.ResultReason.GENERAL_FAILURE
+                        result_message = (
+                            "Operation failed. See the server logs for more "
+                            "information."
+                        )
 
                 # Compose operation result.
                 result_status = contents.ResultStatus(result_status)
@@ -432,6 +438,57 @@ class KmipEngine(object):
                         break
 
         return response_batch
+
+    def _process_message_extensions(self, message_extensions):
+        """
+        Process the message extensions attached to a request batch item.
+
+        The server does not support any vendor-specific message extensions.
+        Per the KMIP specification, non-critical extensions are ignored,
+        while any critical extension must be understood by the server;
+        since none are recognized, any critical extension causes the
+        enclosing batch item to fail before its operation is processed.
+
+        Args:
+            message_extensions (list): A list of MessageExtension structs
+                attached to the request batch item. May be empty.
+
+        Raises:
+            KmipError: if an extension is malformed or if a critical
+                extension is present.
+        """
+        if not message_extensions:
+            return
+
+        for message_extension in message_extensions:
+            criticality_indicator = message_extension.criticality_indicator
+            if not isinstance(criticality_indicator, bool):
+                raise exceptions.KmipError(
+                    status=enums.ResultStatus.OPERATION_FAILED,
+                    reason=enums.ResultReason.INVALID_MESSAGE,
+                    message=(
+                        "Message extension is missing a valid criticality "
+                        "indicator."
+                    )
+                )
+
+            vendor_identification = message_extension.vendor_identification
+            if criticality_indicator:
+                raise exceptions.KmipError(
+                    status=enums.ResultStatus.OPERATION_FAILED,
+                    reason=enums.ResultReason.FEATURE_NOT_SUPPORTED,
+                    message=(
+                        "Message extension for vendor '{0}' is critical "
+                        "and is not supported by the server.".format(
+                            vendor_identification
+                        )
+                    )
+                )
+
+            self._logger.info(
+                "Ignoring non-critical message extension for vendor "
+                "'{0}'.".format(vendor_identification)
+            )
 
     def _get_object_type(self, unique_identifier):
         try:

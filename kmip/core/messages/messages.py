@@ -262,8 +262,26 @@ class RequestBatchItem(Struct):
         self.operation = operation
         self.unique_batch_item_id = unique_batch_item_id
         self.request_payload = request_payload
+        self.message_extensions = []
         self.message_extension = message_extension
         self.ephemeral = ephemeral
+
+    @property
+    def message_extension(self):
+        if self.message_extensions:
+            return self.message_extensions[0]
+        return None
+
+    @message_extension.setter
+    def message_extension(self, value):
+        if value is None:
+            self.message_extensions = []
+        elif isinstance(value, contents.MessageExtension):
+            self.message_extensions = [value]
+        else:
+            raise TypeError(
+                "The message extension must be a MessageExtension object."
+            )
 
     @property
     def ephemeral(self):
@@ -312,10 +330,11 @@ class RequestBatchItem(Struct):
             self.operation.value)
         self.request_payload.read(tstream, kmip_version=kmip_version)
 
-        # Read the message extension if it is present
-        if self.is_tag_next(Tags.MESSAGE_EXTENSION, tstream):
-            self.message_extension = contents.MessageExtension()
-            self.message_extension.read(tstream, kmip_version=kmip_version)
+        # Read the message extensions if any are present
+        while self.is_tag_next(Tags.MESSAGE_EXTENSION, tstream):
+            message_extension = contents.MessageExtension()
+            message_extension.read(tstream, kmip_version=kmip_version)
+            self.message_extensions.append(message_extension)
 
         self.is_oversized(tstream)
 
@@ -334,8 +353,8 @@ class RequestBatchItem(Struct):
 
         self.request_payload.write(tstream, kmip_version=kmip_version)
 
-        if self.message_extension is not None:
-            self.message_extension.write(tstream, kmip_version=kmip_version)
+        for message_extension in self.message_extensions:
+            message_extension.write(tstream, kmip_version=kmip_version)
 
         # Write the length and value of the batch item
         self.length = tstream.length()

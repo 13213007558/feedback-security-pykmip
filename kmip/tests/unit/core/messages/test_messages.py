@@ -146,6 +146,65 @@ class TestRequestBatchItem(testtools.TestCase):
         self.assertEqual(len(self.encoding_kmip_2_0), len(buffer))
         self.assertEqual(str(self.encoding_kmip_2_0), str(buffer))
 
+    def test_invalid_message_extension(self):
+        """
+        Test that a TypeError is raised when an invalid value is used to
+        set the message extension of a RequestBatchItem.
+        """
+        kwargs = {"message_extension": "invalid"}
+        self.assertRaisesRegex(
+            TypeError,
+            "The message extension must be a MessageExtension object.",
+            messages.RequestBatchItem,
+            **kwargs
+        )
+
+    def test_read_write_multiple_message_extensions(self):
+        """
+        Test that a RequestBatchItem structure containing multiple
+        (including duplicate) message extensions can be written to and
+        read back from a data stream.
+        """
+        extension_a = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=True,
+            vendor_extension=b"\x01\x02\x03\x04"
+        )
+        extension_b = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=True,
+            vendor_extension=b"\x01\x02\x03\x04"
+        )
+
+        request_batch_item = messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.DESTROY),
+            request_payload=payloads.DestroyRequestPayload(),
+            message_extension=extension_a
+        )
+        request_batch_item.message_extensions.append(extension_b)
+
+        buffer = utils.BytearrayStream()
+        request_batch_item.write(buffer)
+
+        result = messages.RequestBatchItem()
+        result.read(utils.BytearrayStream(buffer.buffer))
+
+        self.assertEqual(2, len(result.message_extensions))
+        self.assertIs(
+            result.message_extensions[0],
+            result.message_extension
+        )
+        for message_extension in result.message_extensions:
+            self.assertEqual(
+                "Acme",
+                message_extension.vendor_identification
+            )
+            self.assertTrue(message_extension.criticality_indicator)
+            self.assertEqual(
+                b"\x01\x02\x03\x04",
+                message_extension.vendor_extension
+            )
+
 
 class TestResponseHeader(testtools.TestCase):
 

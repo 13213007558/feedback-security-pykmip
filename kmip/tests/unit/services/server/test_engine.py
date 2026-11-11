@@ -15,6 +15,7 @@
 
 import six
 import mock
+import os
 import shutil
 import sqlalchemy
 
@@ -446,6 +447,457 @@ class TestKmipEngine(testtools.TestCase):
         )
 
         e.process_request(request)
+
+    def _build_create_payload(self):
+        """
+        Build a minimal Create request payload for a symmetric key.
+        """
+        attribute_factory = factory.AttributeFactory()
+        template_attribute = objects.TemplateAttribute(
+            attributes=[
+                attribute_factory.create_attribute(
+                    enums.AttributeType.CRYPTOGRAPHIC_ALGORITHM,
+                    enums.CryptographicAlgorithm.AES
+                ),
+                attribute_factory.create_attribute(
+                    enums.AttributeType.CRYPTOGRAPHIC_LENGTH,
+                    256
+                ),
+                attribute_factory.create_attribute(
+                    enums.AttributeType.CRYPTOGRAPHIC_USAGE_MASK,
+                    [
+                        enums.CryptographicUsageMask.ENCRYPT,
+                        enums.CryptographicUsageMask.DECRYPT
+                    ]
+                )
+            ]
+        )
+        return payloads.CreateRequestPayload(
+            enums.ObjectType.SYMMETRIC_KEY,
+            template_attribute
+        )
+
+    def _build_extension_request(self, batch_items, batch_error_option=None):
+        """
+        Build a full request message wrapping the given batch items.
+        """
+        if batch_error_option is None:
+            batch_error_option = enums.BatchErrorContinuationOption.STOP
+
+        header = messages.RequestHeader(
+            protocol_version=contents.ProtocolVersion(1, 2),
+            batch_error_cont_option=contents.BatchErrorContinuationOption(
+                batch_error_option
+            ),
+            batch_order_option=contents.BatchOrderOption(True),
+            time_stamp=contents.TimeStamp(int(time.time())),
+            batch_count=contents.BatchCount(len(batch_items))
+        )
+        return messages.RequestMessage(
+            request_header=header,
+            batch_items=batch_items
+        )
+
+    def _build_create_batch_item(self,
+                                 message_extensions=None,
+                                 unique_batch_item_id=None):
+        """
+        Build a Create request batch item with optional message extensions.
+        """
+        batch_item = messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.CREATE),
+            unique_batch_item_id=unique_batch_item_id,
+            request_payload=self._build_create_payload()
+        )
+        if message_extensions:
+            batch_item.message_extensions = list(message_extensions)
+        return batch_item
+
+    def _build_extension_engine(self):
+        """
+        Build a KmipEngine backed by the in-memory test database.
+        """
+        e = engine.KmipEngine(
+            database_path=os.path.join(self.temp_dir, "pykmip.database")
+        )
+        e._data_store = self.engine
+        e._data_store_session_factory = self.session_factory
+        e._logger = mock.MagicMock()
+        return e
+
+    def _count_managed_objects(self):
+        session = self.session_factory()
+        try:
+            return session.query(pie_objects.ManagedObject).count()
+        finally:
+            session.close()
+
+    def test_process_request_critical_message_extension(self):
+        """
+        Test that a batch item with an unknown critical message extension
+        fails with Feature Not Supported and produces no database side
+        effects.
+        """
+        e = self._build_extension_engine()
+
+        extension = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=True,
+            vendor_extension=b"\x01\x02\x03\x04"
+        )
+        request = self._build_extension_request([
+            self._build_create_batch_item(message_extensions=[extension])
+        ])
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            result.result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.FEATURE_NOT_SUPPORTED,
+            result.result_reason.value
+        )
+        self.assertIsNone(result.response_payload)
+        self.assertEqual(0, self._count_managed_objects())
+
+    def test_process_request_non_critical_message_extension(self):
+        """
+        Test that a batch item with an unknown non-critical message
+        extension is processed normally, per the KMIP specification.
+        """
+        e = self._build_extension_engine()
+
+        extension = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=False,
+            vendor_extension=b"\x01\x02\x03\x04"
+        )
+        request = self._build_extension_request([
+            self._build_create_batch_item(message_extensions=[extension])
+        ])
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            result.result_status.value
+        )
+        self.assertIsNotNone(result.response_payload)
+        self.assertEqual(1, self._count_managed_objects())
+
+        e._logger.info.assert_any_call(
+            "Ignoring non-critical message extension for vendor 'Acme'."
+        )
+
+    def test_process_request_no_message_extension(self):
+        """
+        Test that a legitimate request without any message extension
+        retains its original result.
+        """
+        e = self._build_extension_engine()
+
+        request = self._build_extension_request([
+            self._build_create_batch_item()
+        ])
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            result.result_status.value
+        )
+        self.assertIsNone(result.result_reason)
+        self.assertIsNone(result.result_message)
+        self.assertIsNotNone(result.response_payload)
+        self.assertEqual(1, self._count_managed_objects())
+
+    def test_process_request_multiple_message_extensions(self):
+        """
+        Test that a batch item carrying multiple message extensions fails
+        if any one of them is critical, even when others are non-critical.
+        """
+        e = self._build_extension_engine()
+
+        extensions = [
+            contents.MessageExtension(
+                vendor_identification="Acme",
+                criticality_indicator=False,
+                vendor_extension=b"\x01"
+            ),
+            contents.MessageExtension(
+                vendor_identification="Emca",
+                criticality_indicator=True,
+                vendor_extension=b"\x02"
+            )
+        ]
+        request = self._build_extension_request([
+            self._build_create_batch_item(message_extensions=extensions)
+        ])
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            result.result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.FEATURE_NOT_SUPPORTED,
+            result.result_reason.value
+        )
+        self.assertEqual(0, self._count_managed_objects())
+
+    def test_process_request_duplicate_message_extensions(self):
+        """
+        Test that duplicate critical message extensions on a single batch
+        item are still rejected.
+        """
+        e = self._build_extension_engine()
+
+        extensions = [
+            contents.MessageExtension(
+                vendor_identification="Acme",
+                criticality_indicator=True,
+                vendor_extension=b"\x01"
+            ),
+            contents.MessageExtension(
+                vendor_identification="Acme",
+                criticality_indicator=True,
+                vendor_extension=b"\x01"
+            )
+        ]
+        request = self._build_extension_request([
+            self._build_create_batch_item(message_extensions=extensions)
+        ])
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            result.result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.FEATURE_NOT_SUPPORTED,
+            result.result_reason.value
+        )
+        self.assertEqual(0, self._count_managed_objects())
+
+    def test_process_request_malformed_message_extension_criticality(self):
+        """
+        Test that a message extension with a malformed (missing)
+        criticality indicator fails the batch item with Invalid Message.
+        """
+        e = self._build_extension_engine()
+
+        extension = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=False,
+            vendor_extension=b"\x01"
+        )
+        extension._criticality_indicator = None
+        request = self._build_extension_request([
+            self._build_create_batch_item(message_extensions=[extension])
+        ])
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            result.result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.INVALID_MESSAGE,
+            result.result_reason.value
+        )
+        self.assertEqual(0, self._count_managed_objects())
+
+    def test_process_request_message_extension_batch_stop(self):
+        """
+        Test that a critical message extension failure halts the remaining
+        batch when the batch error continuation option is Stop.
+        """
+        e = self._build_extension_engine()
+
+        extension = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=True,
+            vendor_extension=b"\x01"
+        )
+        request = self._build_extension_request(
+            [
+                self._build_create_batch_item(
+                    message_extensions=[extension],
+                    unique_batch_item_id=contents.UniqueBatchItemID(1)
+                ),
+                self._build_create_batch_item(
+                    unique_batch_item_id=contents.UniqueBatchItemID(2)
+                )
+            ],
+            batch_error_option=enums.BatchErrorContinuationOption.STOP
+        )
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            result.result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.FEATURE_NOT_SUPPORTED,
+            result.result_reason.value
+        )
+        self.assertEqual(0, self._count_managed_objects())
+
+    def test_process_request_message_extension_batch_continue(self):
+        """
+        Test that a critical message extension failure does not prevent
+        subsequent batch items from processing when the batch error
+        continuation option is Continue.
+        """
+        e = self._build_extension_engine()
+
+        extension = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=True,
+            vendor_extension=b"\x01"
+        )
+        request = self._build_extension_request(
+            [
+                self._build_create_batch_item(
+                    message_extensions=[extension],
+                    unique_batch_item_id=contents.UniqueBatchItemID(1)
+                ),
+                self._build_create_batch_item(
+                    unique_batch_item_id=contents.UniqueBatchItemID(2)
+                )
+            ],
+            batch_error_option=enums.BatchErrorContinuationOption.CONTINUE
+        )
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(2, len(batch))
+
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            batch[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.FEATURE_NOT_SUPPORTED,
+            batch[0].result_reason.value
+        )
+        self.assertIsNone(batch[0].response_payload)
+
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            batch[1].result_status.value
+        )
+        self.assertIsNotNone(batch[1].response_payload)
+
+        self.assertEqual(1, self._count_managed_objects())
+
+    def test_process_request_get_critical_message_extension(self):
+        """
+        Test that a Get operation carrying an unknown critical message
+        extension fails without exporting the stored key.
+        """
+        e = self._build_extension_engine()
+        e._data_session = self.session_factory()
+
+        create_payload = self._build_create_payload()
+        response_payload = e._process_create(create_payload)
+        uid = str(response_payload.unique_identifier)
+        self.assertEqual(1, self._count_managed_objects())
+
+        extension = contents.MessageExtension(
+            vendor_identification="Acme",
+            criticality_indicator=True,
+            vendor_extension=b"\x01"
+        )
+        get_batch_item = messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.GET),
+            request_payload=payloads.GetRequestPayload(
+                unique_identifier=uid
+            ),
+            message_extension=extension
+        )
+        request = self._build_extension_request([get_batch_item])
+
+        response, max_response_size, version = e.process_request(
+            request,
+            ["tester", None]
+        )
+
+        batch = response.batch_items
+        self.assertEqual(1, len(batch))
+
+        result = batch[0]
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            result.result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.FEATURE_NOT_SUPPORTED,
+            result.result_reason.value
+        )
+        self.assertIsNone(result.response_payload)
+
+        # The stored object must remain untouched and unexported.
+        self.assertEqual(1, self._count_managed_objects())
 
     def test_build_error_response(self):
         """
