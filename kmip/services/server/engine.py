@@ -59,7 +59,6 @@ class KmipEngine(object):
         * KMIP versions > 1.2
         * Numerous operations, objects, and attributes.
         * User authentication
-        * Batch processing options: UNDO
         * Asynchronous operations
         * Operation policies
         * Object archival
@@ -70,6 +69,11 @@ class KmipEngine(object):
         * Managed object state tracking
         * Managed object usage limit tracking and enforcement
         * Cryptographic usage mask enforcement per object type
+
+    Every supported operation is backed solely by the local SQLite database,
+    so each request can be wrapped in a single database transaction. This
+    allows the UNDO batch error continuation option to roll back all changes
+    made earlier in the batch when a later operation fails.
     """
 
     def __init__(self, policies=None, database_path=None):
@@ -209,6 +213,9 @@ class KmipEngine(object):
                 the request batch items.
         """
         self._client_identity = [None, None]
+        # The ID placeholder is request-scoped. Never let a temporary ID set
+        # by a Create/Register in one request leak into the next batch.
+        self._id_placeholder = None
         header = request.request_header
 
         # Process the protocol version
@@ -294,9 +301,10 @@ class KmipEngine(object):
             batch_error_option = header.batch_error_cont_option.value
 
         if batch_error_option == enums.BatchErrorContinuationOption.UNDO:
-            raise exceptions.InvalidMessage(
-                "Undo option for batch handling is not supported."
-            )
+            # Verify ahead of time that every operation can participate in a
+            # single atomic transaction. Reject the whole request before any
+            # side effect is produced.
+            self._verify_undo_supported(request.batch_items)
 
         # Process the batch order option
         batch_order_option = False
@@ -352,14 +360,72 @@ class KmipEngine(object):
         )
         return self._build_response(version, [batch_item])
 
+    # The set of operations that can be executed atomically inside a single
+    # database transaction. Every operation implemented by the engine acts
+    # only on the local SQLite database, so all of them qualify. An operation
+    # defined by KMIP but not implemented here, or any future operation with
+    # external, non-transactional side effects, must be kept out of this set
+    # so UNDO batches are rejected before any work is done.
+    _undo_supported_operations = frozenset([
+        enums.Operation.CREATE,
+        enums.Operation.CREATE_KEY_PAIR,
+        enums.Operation.REGISTER,
+        enums.Operation.DERIVE_KEY,
+        enums.Operation.LOCATE,
+        enums.Operation.GET,
+        enums.Operation.GET_ATTRIBUTES,
+        enums.Operation.GET_ATTRIBUTE_LIST,
+        enums.Operation.SET_ATTRIBUTE,
+        enums.Operation.MODIFY_ATTRIBUTE,
+        enums.Operation.DELETE_ATTRIBUTE,
+        enums.Operation.ACTIVATE,
+        enums.Operation.REVOKE,
+        enums.Operation.DESTROY,
+        enums.Operation.QUERY,
+        enums.Operation.DISCOVER_VERSIONS,
+        enums.Operation.ENCRYPT,
+        enums.Operation.DECRYPT,
+        enums.Operation.SIGN,
+        enums.Operation.SIGNATURE_VERIFY,
+        enums.Operation.MAC
+    ])
+
+    def _verify_undo_supported(self, request_batch):
+        """
+        Verify that every operation in an UNDO batch can be executed inside a
+        single atomic database transaction.
+
+        An unsupported operation invalidates the atomicity guarantee, so the
+        whole request is rejected before any batch item is processed and
+        before any side effect is produced.
+
+        Args:
+            request_batch (list): The list of RequestBatchItem objects making
+                up the UNDO batch.
+
+        Raises:
+            InvalidMessage: If any batch item requests an operation that
+                cannot participate in an atomic transaction.
+        """
+        for batch_item in request_batch:
+            operation = batch_item.operation.value
+            if operation not in self._undo_supported_operations:
+                raise exceptions.InvalidMessage(
+                    "The {0} operation cannot be included in a batch with "
+                    "the UNDO error continuation option. It cannot be "
+                    "executed atomically with the other operations in the "
+                    "batch.".format(operation.name.title())
+                )
+
     def _process_batch(self, request_batch, batch_handling, batch_order):
         response_batch = list()
+        error_occurred = False
 
         with self._data_store_session_factory() as session:
             self._data_session = session
 
             for batch_item in request_batch:
-                error_occurred = False
+                item_failed = False
 
                 response_payload = None
                 result_status = None
@@ -391,7 +457,7 @@ class KmipEngine(object):
 
                     result_status = enums.ResultStatus.SUCCESS
                 except exceptions.KmipError as e:
-                    error_occurred = True
+                    item_failed = True
                     result_status = e.status
                     result_reason = e.reason
                     result_message = str(e)
@@ -401,7 +467,7 @@ class KmipEngine(object):
                     )
                     self._logger.exception(e)
 
-                    error_occurred = True
+                    item_failed = True
                     result_status = enums.ResultStatus.OPERATION_FAILED
                     result_reason = enums.ResultReason.GENERAL_FAILURE
                     result_message = (
@@ -427,9 +493,27 @@ class KmipEngine(object):
                 response_batch.append(batch_item)
 
                 # Handle batch error if necessary.
-                if error_occurred:
-                    if batch_handling == enums.BatchErrorContinuationOption.STOP:
+                if item_failed:
+                    error_occurred = True
+
+                    if batch_handling == \
+                            enums.BatchErrorContinuationOption.UNDO:
+                        # Discard every change made by the batch so far and
+                        # stop processing. The failed item is still reported
+                        # in the response.
+                        session.rollback()
                         break
+                    elif batch_handling == \
+                            enums.BatchErrorContinuationOption.STOP:
+                        break
+
+            if not error_occurred:
+                session.commit()
+            elif batch_handling != enums.BatchErrorContinuationOption.UNDO:
+                # STOP and CONTINUE preserve the work completed before the
+                # failure. Individual handlers only flush their changes, so
+                # make them durable here.
+                session.commit()
 
         return response_batch
 
@@ -1400,9 +1484,10 @@ class KmipEngine(object):
 
         self._data_session.add(managed_object)
 
-        # NOTE (peterhamilton) SQLAlchemy will *not* assign an ID until
-        # commit is called. This makes future support for UNDO problematic.
-        self._data_session.commit()
+        # Flush, rather than commit, so the ID is assigned and the object is
+        # visible to later operations in the batch while the batch-level
+        # transaction still controls commit or rollback (enabling UNDO).
+        self._data_session.flush()
 
         self._logger.info(
             "Created a SymmetricKey with ID: {0}".format(
@@ -1569,9 +1654,10 @@ class KmipEngine(object):
         self._data_session.add(public_key)
         self._data_session.add(private_key)
 
-        # NOTE (peterhamilton) SQLAlchemy will *not* assign an ID until
-        # commit is called. This makes future support for UNDO problematic.
-        self._data_session.commit()
+        # Flush, rather than commit, so the ID is assigned and the object is
+        # visible to later operations in the batch while the batch-level
+        # transaction still controls commit or rollback (enabling UNDO).
+        self._data_session.flush()
 
         self._logger.info(
             "Created a PublicKey with ID: {0}".format(
@@ -1668,7 +1754,7 @@ class KmipEngine(object):
             managed_object,
             (attribute_name, attribute_index, attribute_value)
         )
-        self._data_session.commit()
+        self._data_session.flush()
 
         response_payload = payloads.DeleteAttributeResponsePayload(
             unique_identifier=unique_identifier,
@@ -1719,7 +1805,7 @@ class KmipEngine(object):
             managed_object,
             {attribute_name: payload.new_attribute.attribute}
         )
-        self._data_session.commit()
+        self._data_session.flush()
 
         return payloads.SetAttributeResponsePayload(
             unique_identifier=unique_identifier
@@ -1798,7 +1884,7 @@ class KmipEngine(object):
                             new_attribute,
                             index
                         )
-                        self._data_session.commit()
+                        self._data_session.flush()
             else:
                 if current_attribute is None:
                     # Verify the attribute is set.
@@ -1838,7 +1924,7 @@ class KmipEngine(object):
                     managed_object,
                     (attribute_name, new_attribute)
                 )
-                self._data_session.commit()
+                self._data_session.flush()
 
             return payloads.ModifyAttributeResponsePayload(
                 unique_identifier=unique_identifier
@@ -1884,7 +1970,7 @@ class KmipEngine(object):
                         attribute_value,
                         attribute_index
                     )
-                    self._data_session.commit()
+                    self._data_session.flush()
                 else:
                     raise exceptions.KmipError(
                         status=enums.ResultStatus.OPERATION_FAILED,
@@ -1929,7 +2015,7 @@ class KmipEngine(object):
                         managed_object,
                         (attribute_name, attribute_value)
                     )
-                    self._data_session.commit()
+                    self._data_session.flush()
 
                 existing_attributes = self._get_attributes_from_managed_object(
                     managed_object,
@@ -1989,9 +2075,10 @@ class KmipEngine(object):
 
         self._data_session.add(managed_object)
 
-        # NOTE (peterhamilton) SQLAlchemy will *not* assign an ID until
-        # commit is called. This makes future support for UNDO problematic.
-        self._data_session.commit()
+        # Flush, rather than commit, so the ID is assigned and the object is
+        # visible to later operations in the batch while the batch-level
+        # transaction still controls commit or rollback (enabling UNDO).
+        self._data_session.flush()
 
         self._logger.info(
             "Registered a {0} with ID: {1}".format(
@@ -2174,7 +2261,7 @@ class KmipEngine(object):
         managed_object.initial_date = int(time.time())
 
         self._data_session.add(managed_object)
-        self._data_session.commit()
+        self._data_session.flush()
 
         self._logger.info(
             "Created a {0} with ID: {1}".format(
@@ -2708,7 +2795,7 @@ class KmipEngine(object):
             )
 
         managed_object.state = enums.State.ACTIVE
-        self._data_session.commit()
+        self._data_session.flush()
 
         response_payload = payloads.ActivateResponsePayload(
             unique_identifier=attributes.UniqueIdentifier(unique_identifier)
@@ -2763,7 +2850,7 @@ class KmipEngine(object):
                 )
             else:
                 managed_object.state = enums.State.DEACTIVATED
-        self._data_session.commit()
+        self._data_session.flush()
 
         response_payload = payloads.RevokeResponsePayload(
             unique_identifier=attributes.UniqueIdentifier(unique_identifier)
@@ -2809,7 +2896,7 @@ class KmipEngine(object):
             unique_identifier=attributes.UniqueIdentifier(unique_identifier)
         )
 
-        self._data_session.commit()
+        self._data_session.flush()
 
         return response_payload
 

@@ -2,6 +2,20 @@
 Changelog
 =========
 
+.. _v0.11:
+
+0.12 - Unreleased
+~~~~~~~~~~~~~~~~~
+
+New Features
+
+* Atomic UNDO batches — The server now supports the UNDO batch error
+  continuation option for the local database backend. Each request runs in a
+  single SQLite transaction: when an operation in an UNDO batch fails, all
+  changes made by the earlier operations are rolled back. Batches containing
+  an operation that cannot run atomically are rejected before any side effect
+  is produced. The STOP and CONTINUE options keep their original semantics.
+
 .. _v0.10:
 
 0.11 - September 9, 2026

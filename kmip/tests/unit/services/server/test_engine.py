@@ -15,6 +15,7 @@
 
 import six
 import mock
+import os
 import shutil
 import sqlalchemy
 
@@ -382,13 +383,15 @@ class TestKmipEngine(testtools.TestCase):
             *args
         )
 
-    def test_process_request_unsupported_batch_option(self):
+    def test_process_request_undo_preflight_rejects_bad_operation(self):
         """
-        Test that an InvalidMessage error is generated while processing a
-        batch with an unsupported batch error continuation option.
+        Test that an UNDO batch containing an operation that cannot be
+        executed atomically is rejected with an InvalidMessage error before
+        any batch item is processed.
         """
         e = engine.KmipEngine()
         e._logger = mock.MagicMock()
+        e._process_operation = mock.MagicMock()
 
         protocol = contents.ProtocolVersion(1, 1)
         header = messages.RequestHeader(
@@ -396,21 +399,104 @@ class TestKmipEngine(testtools.TestCase):
             authentication=contents.Authentication(),
             batch_error_cont_option=contents.BatchErrorContinuationOption(
                 enums.BatchErrorContinuationOption.UNDO
-            )
+            ),
+            time_stamp=contents.TimeStamp(int(time.time())),
+            batch_count=contents.BatchCount(1)
         )
+        batch = list([
+            messages.RequestBatchItem(
+                operation=contents.Operation(
+                    enums.Operation.RNG_RETRIEVE
+                )
+            )
+        ])
         request = messages.RequestMessage(
             request_header=header,
+            batch_items=batch
         )
 
         args = (request, )
-        regex = "Undo option for batch handling is not supported."
         six.assertRaisesRegex(
             self,
             exceptions.InvalidMessage,
-            regex,
+            "cannot be included in a batch with the UNDO",
             e.process_request,
             *args
         )
+        # The preflight check must reject the request before any side effect.
+        self.assertEqual(0, e._process_operation.call_count)
+
+    def test_process_request_undo_preflight_runs_before_processing(self):
+        """
+        Test that the UNDO preflight check inspects every batch item and
+        rejects the request even when an unsupported operation appears after
+        a supported one, so the supported operation is never executed.
+        """
+        e = engine.KmipEngine()
+        e._logger = mock.MagicMock()
+        e._process_operation = mock.MagicMock()
+
+        protocol = contents.ProtocolVersion(1, 1)
+        header = messages.RequestHeader(
+            protocol_version=protocol,
+            authentication=contents.Authentication(),
+            batch_error_cont_option=contents.BatchErrorContinuationOption(
+                enums.BatchErrorContinuationOption.UNDO
+            ),
+            time_stamp=contents.TimeStamp(int(time.time())),
+            batch_count=contents.BatchCount(2)
+        )
+        batch = list([
+            messages.RequestBatchItem(
+                operation=contents.Operation(
+                    enums.Operation.CREATE
+                ),
+                unique_batch_item_id=contents.UniqueBatchItemID(1)
+            ),
+            messages.RequestBatchItem(
+                operation=contents.Operation(
+                    enums.Operation.LOG
+                ),
+                unique_batch_item_id=contents.UniqueBatchItemID(2)
+            )
+        ])
+        request = messages.RequestMessage(
+            request_header=header,
+            batch_items=batch
+        )
+
+        six.assertRaisesRegex(
+            self,
+            exceptions.InvalidMessage,
+            "cannot be included in a batch with the UNDO",
+            e.process_request,
+            request
+        )
+        self.assertEqual(0, e._process_operation.call_count)
+
+    def test_verify_undo_supported_accepts_implemented_operations(self):
+        """
+        Test that the UNDO preflight check accepts a batch made up entirely
+        of operations implemented by the engine, all of which are backed by
+        the local database.
+        """
+        e = engine.KmipEngine()
+        e._logger = mock.MagicMock()
+
+        batch = list([
+            messages.RequestBatchItem(
+                operation=contents.Operation(enums.Operation.CREATE)
+            ),
+            messages.RequestBatchItem(
+                operation=contents.Operation(enums.Operation.ACTIVATE)
+            ),
+            messages.RequestBatchItem(
+                operation=contents.Operation(enums.Operation.DESTROY)
+            )
+        ])
+
+        # Should not raise.
+        e._verify_undo_supported(batch)
 
     def test_process_request_missing_credential(self):
         """
@@ -12552,3 +12638,429 @@ class TestKmipEngine(testtools.TestCase):
             e._process_sign,
             *args
         )
+
+
+class TestKmipEngineUndoBatches(testtools.TestCase):
+    """
+    A test suite for the UNDO batch error continuation option.
+
+    These tests run the engine against a real, temporary SQLite database
+    file and verify the records that are actually committed to disk, rather
+    than mocking the database session.
+    """
+
+    def setUp(self):
+        super(TestKmipEngineUndoBatches, self).setUp()
+
+        self.temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.temp_dir)
+        self.database_path = os.path.join(self.temp_dir, 'pykmip-undo.db')
+
+        self.engine = engine.KmipEngine(database_path=self.database_path)
+        self.engine._is_allowed_by_operation_policy = mock.Mock(
+            return_value=True
+        )
+        self.credential = ('undo-tester', None)
+
+    def _request(self, batch_items, batch_option):
+        header = messages.RequestHeader(
+            protocol_version=contents.ProtocolVersion(1, 1),
+            batch_error_cont_option=contents.BatchErrorContinuationOption(
+                batch_option
+            ),
+            time_stamp=contents.TimeStamp(int(time.time())),
+            batch_count=contents.BatchCount(len(batch_items))
+        )
+        return messages.RequestMessage(
+            request_header=header,
+            batch_items=batch_items
+        )
+
+    def _template_attribute(self):
+        attribute_factory = factory.AttributeFactory()
+        return objects.TemplateAttribute(
+            attributes=[
+                attribute_factory.create_attribute(
+                    enums.AttributeType.CRYPTOGRAPHIC_ALGORITHM,
+                    enums.CryptographicAlgorithm.AES
+                ),
+                attribute_factory.create_attribute(
+                    enums.AttributeType.CRYPTOGRAPHIC_LENGTH,
+                    256
+                ),
+                attribute_factory.create_attribute(
+                    enums.AttributeType.CRYPTOGRAPHIC_USAGE_MASK,
+                    [
+                        enums.CryptographicUsageMask.ENCRYPT,
+                        enums.CryptographicUsageMask.DECRYPT
+                    ]
+                )
+            ]
+        )
+
+    def _create_batch_item(self, batch_id):
+        return messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.CREATE),
+            unique_batch_item_id=contents.UniqueBatchItemID(batch_id),
+            request_payload=payloads.CreateRequestPayload(
+                enums.ObjectType.SYMMETRIC_KEY,
+                self._template_attribute()
+            )
+        )
+
+    def _get_batch_item(self, batch_id, unique_identifier=None):
+        return messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.GET),
+            unique_batch_item_id=contents.UniqueBatchItemID(batch_id),
+            request_payload=payloads.GetRequestPayload(
+                unique_identifier=unique_identifier
+            )
+        )
+
+    def _activate_batch_item(self, batch_id, unique_identifier=None):
+        return messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.ACTIVATE),
+            unique_batch_item_id=contents.UniqueBatchItemID(batch_id),
+            request_payload=payloads.ActivateRequestPayload(
+                unique_identifier=attributes.UniqueIdentifier(
+                    unique_identifier
+                ) if unique_identifier else None
+            )
+        )
+
+    def _destroy_batch_item(self, batch_id, unique_identifier=None):
+        return messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.DESTROY),
+            unique_batch_item_id=contents.UniqueBatchItemID(batch_id),
+            request_payload=payloads.DestroyRequestPayload(
+                unique_identifier=attributes.UniqueIdentifier(
+                    unique_identifier
+                ) if unique_identifier else None
+            )
+        )
+
+    def _revoke_batch_item(self, batch_id, unique_identifier=None):
+        revocation_reason = objects.RevocationReason(
+            code=enums.RevocationReasonCode.UNSPECIFIED
+        )
+        return messages.RequestBatchItem(
+            operation=contents.Operation(enums.Operation.REVOKE),
+            unique_batch_item_id=contents.UniqueBatchItemID(batch_id),
+            request_payload=payloads.RevokeRequestPayload(
+                unique_identifier=attributes.UniqueIdentifier(
+                    unique_identifier
+                ) if unique_identifier else None,
+                revocation_reason=revocation_reason
+            )
+        )
+
+    def _committed_objects(self):
+        """
+        Open a brand new connection to the database file so that only
+        committed data is visible.
+        """
+        data_store = sqlalchemy.create_engine(
+            'sqlite:///{}'.format(self.database_path)
+        )
+        try:
+            session = sqlalchemy.orm.sessionmaker(bind=data_store)()
+            try:
+                objects = session.query(pie_objects.ManagedObject).all()
+                # Read the attributes while the session is still open so
+                # expired attributes do not trigger a refresh after detach.
+                return [
+                    (
+                        managed_object.unique_identifier,
+                        managed_object._object_type,
+                        getattr(managed_object, 'state', None)
+                    )
+                    for managed_object in objects
+                ]
+            finally:
+                session.close()
+        finally:
+            data_store.dispose()
+
+    def _process(self, batch_items, batch_option):
+        response, _, _ = self.engine.process_request(
+            self._request(batch_items, batch_option),
+            credential=self.credential
+        )
+        return response
+
+    def test_successful_undo_batch_is_committed(self):
+        """
+        Test that an UNDO batch in which every operation succeeds is
+        committed in full to the database.
+        """
+        response = self._process(
+            [self._create_batch_item(1), self._get_batch_item(2)],
+            enums.BatchErrorContinuationOption.UNDO
+        )
+
+        statuses = [
+            item.result_status.value for item in response.batch_items
+        ]
+        self.assertEqual(
+            [enums.ResultStatus.SUCCESS, enums.ResultStatus.SUCCESS],
+            statuses
+        )
+
+        committed = self._committed_objects()
+        self.assertEqual(1, len(committed))
+        self.assertEqual(
+            response.batch_items[0].response_payload.unique_identifier,
+            str(committed[0][0])
+        )
+
+    def test_create_then_implicit_operation_rolls_back_on_failure(self):
+        """
+        Test that an object created earlier in an UNDO batch is removed when
+        a later operation fails, including when the later operation refers
+        to the created object only through the implicit ID placeholder.
+
+        A freshly created key is pre-active, so revoking it without the key
+        compromise reason code is an illegal operation.
+        """
+        failing_revoke = self._revoke_batch_item(2)
+        response = self._process(
+            [self._create_batch_item(1), failing_revoke],
+            enums.BatchErrorContinuationOption.UNDO
+        )
+
+        self.assertEqual(2, len(response.batch_items))
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            response.batch_items[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            response.batch_items[1].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.ILLEGAL_OPERATION,
+            response.batch_items[1].result_reason.value
+        )
+
+        # The newly created object must not survive on disk.
+        self.assertEqual([], self._committed_objects())
+
+    def test_create_then_implicit_activate_succeeds_and_commits(self):
+        """
+        Test that an operation using the implicit ID placeholder can target
+        an object created earlier in the same UNDO batch, and that the
+        resulting state change is committed when nothing fails.
+        """
+        response = self._process(
+            [self._create_batch_item(1), self._activate_batch_item(2)],
+            enums.BatchErrorContinuationOption.UNDO
+        )
+
+        statuses = [
+            item.result_status.value for item in response.batch_items
+        ]
+        self.assertEqual(
+            [enums.ResultStatus.SUCCESS, enums.ResultStatus.SUCCESS],
+            statuses
+        )
+
+        committed = self._committed_objects()
+        self.assertEqual(1, len(committed))
+        self.assertEqual(enums.State.ACTIVE, committed[0][2])
+
+    def test_update_of_existing_object_is_undone(self):
+        """
+        Test that a state change applied to an already committed object is
+        rolled back when a later operation in the same UNDO batch fails.
+        """
+        create_response = self._process(
+            [self._create_batch_item(1)],
+            enums.BatchErrorContinuationOption.UNDO
+        )
+        existing_uid = create_response.batch_items[0].\
+            response_payload.unique_identifier
+
+        failing_batch = [
+            self._activate_batch_item(2, existing_uid),
+            self._destroy_batch_item(3, '999999')
+        ]
+        response = self._process(
+            failing_batch,
+            enums.BatchErrorContinuationOption.UNDO
+        )
+
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            response.batch_items[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            response.batch_items[1].result_status.value
+        )
+
+        committed = self._committed_objects()
+        self.assertEqual(1, len(committed))
+        self.assertEqual(enums.State.PRE_ACTIVE, committed[0][2])
+        self.assertEqual(int(existing_uid), committed[0][0])
+
+    def test_permission_denied_rolls_back_prior_changes(self):
+        """
+        Test that a permission error on a later batch item undoes the
+        changes made by the earlier, successful items.
+        """
+        self.engine._is_allowed_by_operation_policy = mock.Mock(
+            return_value=False
+        )
+
+        response = self._process(
+            [
+                self._create_batch_item(1),
+                self._get_batch_item(2, '1')
+            ],
+            enums.BatchErrorContinuationOption.UNDO
+        )
+
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            response.batch_items[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            response.batch_items[1].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.PERMISSION_DENIED,
+            response.batch_items[1].result_reason.value
+        )
+
+        self.assertEqual([], self._committed_objects())
+
+    def test_id_placeholder_does_not_leak_between_requests(self):
+        """
+        Test that the implicit ID placeholder set by one request is reset
+        for the next request. An implicit Get with no preceding Create in
+        the same request must fail rather than reuse an old placeholder.
+        """
+        create_response = self._process(
+            [self._create_batch_item(1)],
+            enums.BatchErrorContinuationOption.STOP
+        )
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            create_response.batch_items[0].result_status.value
+        )
+        self.assertIsNotNone(self.engine._id_placeholder)
+
+        follow_up = self._process(
+            [self._get_batch_item(2)],
+            enums.BatchErrorContinuationOption.STOP
+        )
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            follow_up.batch_items[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultReason.ITEM_NOT_FOUND,
+            follow_up.batch_items[0].result_reason.value
+        )
+
+    def test_failed_undo_batch_leaves_nothing_on_retry(self):
+        """
+        Test that retrying the same failing UNDO batch never accumulates
+        half-finished objects in the database.
+        """
+        failing_batch = [
+            self._create_batch_item(1),
+            self._destroy_batch_item(2, '999999')
+        ]
+
+        for _ in range(3):
+            response = self._process(
+                failing_batch,
+                enums.BatchErrorContinuationOption.UNDO
+            )
+            self.assertEqual(
+                enums.ResultStatus.SUCCESS,
+                response.batch_items[0].result_status.value
+            )
+            self.assertEqual(
+                enums.ResultStatus.OPERATION_FAILED,
+                response.batch_items[1].result_status.value
+            )
+            self.assertEqual([], self._committed_objects())
+
+    def test_stop_option_still_commits_partial_work(self):
+        """
+        Test that the STOP option retains its original semantics: work
+        completed before the failure is kept and the batch ends early.
+        """
+        response = self._process(
+            [
+                self._create_batch_item(1),
+                self._destroy_batch_item(2, '999999')
+            ],
+            enums.BatchErrorContinuationOption.STOP
+        )
+
+        self.assertEqual(2, len(response.batch_items))
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            response.batch_items[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            response.batch_items[1].result_status.value
+        )
+        self.assertEqual(1, len(self._committed_objects()))
+
+    def test_continue_option_still_processes_after_failure(self):
+        """
+        Test that the CONTINUE option retains its original semantics: later
+        batch items are still processed after an earlier failure and their
+        changes are committed.
+        """
+        response = self._process(
+            [
+                self._destroy_batch_item(1, '999999'),
+                self._create_batch_item(2)
+            ],
+            enums.BatchErrorContinuationOption.CONTINUE
+        )
+
+        self.assertEqual(2, len(response.batch_items))
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            response.batch_items[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            response.batch_items[1].result_status.value
+        )
+        self.assertEqual(1, len(self._committed_objects()))
+
+    def test_undo_preflight_rejects_before_any_change(self):
+        """
+        Test that an UNDO batch containing an operation that cannot run
+        atomically is rejected before any side effect is produced, even
+        when the unsupported item follows a valid Create.
+        """
+        batch = [
+            self._create_batch_item(1),
+            messages.RequestBatchItem(
+                operation=contents.Operation(enums.Operation.RNG_RETRIEVE),
+                unique_batch_item_id=contents.UniqueBatchItemID(2)
+            )
+        ]
+
+        six.assertRaisesRegex(
+            self,
+            exceptions.InvalidMessage,
+            "cannot be included in a batch with the UNDO",
+            self.engine.process_request,
+            self._request(
+                batch,
+                enums.BatchErrorContinuationOption.UNDO
+            )
+        )
+
+        self.assertEqual([], self._committed_objects())
