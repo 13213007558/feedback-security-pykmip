@@ -33,6 +33,15 @@ class ClientConnectionNotOpen(Exception):
             "client connection not open")
 
 
+class KeyMaterialConsistencyError(Exception):
+    """
+    An exception raised when the declared key metadata (algorithm,
+    cryptographic length, key format type) is inconsistent with the key
+    material that can be inspected without unwrapping the value.
+    """
+    pass
+
+
 class KmipOperationFailure(Exception):
     """
     An exception raised upon the failure of a KMIP appliance operation.

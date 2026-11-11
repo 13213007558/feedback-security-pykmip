@@ -23,6 +23,20 @@ New Features
 
 Bug Fixes
 
+* Register key material validation — The server now verifies that keys
+  submitted through Register are consistent with their declared algorithm,
+  cryptographic length, and key format type before they are persisted or
+  become visible to other operations. Unwrapped symmetric keys must carry
+  raw material whose bit length matches the declared length and is valid
+  for the declared algorithm. RSA public (Raw, PKCS#1, X.509) and private
+  (Raw, PKCS#1, PKCS#8) keys are parsed and checked against the declared
+  format and length. Keys carrying key wrapping data are not checked
+  against their wrapped byte count, since the wrapped value is ciphertext;
+  only their declared format support is verified. Inconsistent
+  registrations are rejected with an InvalidField error.
+* KMIP_SERVER_DB_PATH — The server's default SQLite database location can
+  now be overridden with the KMIP_SERVER_DB_PATH environment variable,
+  which is useful in environments where /tmp is not writable.
 * cryptography >= 42.0.0 compatibility — Fixed a breaking change where
   load_der_public_key and load_pem_private_key were removed from the Backend
   class in cryptography 42.0.0. Methods now use the top-level serialization

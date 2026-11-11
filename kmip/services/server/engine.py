@@ -15,6 +15,7 @@
 
 import copy
 import logging
+import os
 import six
 import sqlalchemy
 
@@ -39,7 +40,9 @@ from kmip.core.messages import messages
 
 from kmip.core.messages import payloads
 
+from kmip.pie import exceptions as pie_exceptions
 from kmip.pie import factory
+from kmip.pie import key_material
 from kmip.pie import objects
 from kmip.pie import sqltypes
 
@@ -90,7 +93,11 @@ class KmipEngine(object):
 
         self.database_path = 'sqlite:///{}'.format(database_path)
         if not database_path:
-            self.database_path = 'sqlite:////tmp/pykmip.database'
+            database_path = os.environ.get(
+                'KMIP_SERVER_DB_PATH',
+                '/tmp/pykmip.database'
+            )
+            self.database_path = 'sqlite:///{}'.format(database_path)
 
         self._data_store = sqlalchemy.create_engine(
             self.database_path,
@@ -1975,7 +1982,17 @@ class KmipEngine(object):
             )
 
         managed_object_factory = factory.ObjectFactory()
-        managed_object = managed_object_factory.convert(secret)
+        try:
+            managed_object = managed_object_factory.convert(secret)
+        except (TypeError, ValueError) as e:
+            # The managed object failed its own structural validation (e.g.,
+            # a declared key length that does not match the key material).
+            # Surface this as a client-facing field error instead of an
+            # unexpected server failure, and leave nothing behind.
+            self._data_session.rollback()
+            raise exceptions.InvalidField(
+                "The managed object is not well-formed: {0}".format(e)
+            )
         managed_object.names = []
 
         self._set_attributes_on_managed_object(
@@ -1986,6 +2003,17 @@ class KmipEngine(object):
         # TODO (peterhamilton) Set additional server-only attributes.
         managed_object._owner = self._client_identity[0]
         managed_object.initial_date = int(time.time())
+
+        # Verify that the declared algorithm, length, and key format are
+        # consistent with the material that can be inspected without
+        # unwrapping. This must pass before the object is added to the
+        # session or committed, so invalid registrations never become visible
+        # to Get or to cryptographic operations.
+        try:
+            key_material.validate_key_material(managed_object)
+        except pie_exceptions.KeyMaterialConsistencyError as e:
+            self._data_session.rollback()
+            raise exceptions.InvalidField(str(e))
 
         self._data_session.add(managed_object)
 
