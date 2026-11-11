@@ -377,13 +377,9 @@ class KMIPProxy(object):
         request_message = self._build_request_message(credential, [batch_item])
         response_message = self._send_and_receive_message(request_message)
 
-        if len(response_message.batch_items) != 1:
-            raise exceptions.InvalidMessage(
-                "The response message does not have the right number of "
-                "requested operation results."
-            )
-
-        batch_item = response_message.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, response_message
+        )
 
         if batch_item.result_status.value != enums.ResultStatus.SUCCESS:
             raise exceptions.OperationFailure(
@@ -445,7 +441,7 @@ class KMIPProxy(object):
         else:
             request = self._build_request_message(credential, [batch_item])
             response = self._send_and_receive_message(request)
-            results = self._process_batch_items(response)
+            results = self._process_batch_items(request, response)
             return results[0]
 
     def activate(self, uuid=None, credential=None):
@@ -516,7 +512,9 @@ class KMIPProxy(object):
 
         request = self._build_request_message(credential, [batch_item])
         response = self._send_and_receive_message(request)
-        batch_item = response.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request, response
+        )
         payload = batch_item.response_payload
 
         result = {}
@@ -600,7 +598,9 @@ class KMIPProxy(object):
 
         request = self._build_request_message(credential, [batch_item])
         response = self._send_and_receive_message(request)
-        batch_item = response.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request, response
+        )
         payload = batch_item.response_payload
 
         result = {}
@@ -691,7 +691,9 @@ class KMIPProxy(object):
 
         request = self._build_request_message(credential, [batch_item])
         response = self._send_and_receive_message(request)
-        batch_item = response.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request, response
+        )
         payload = batch_item.response_payload
 
         result = {}
@@ -754,7 +756,7 @@ class KMIPProxy(object):
 
         request = self._build_request_message(None, [batch_item])
         response = self._send_and_receive_message(request)
-        results = self._process_batch_items(response)
+        results = self._process_batch_items(request, response)
         return results[0]
 
     def get_attribute_list(self, uid=None):
@@ -773,7 +775,7 @@ class KMIPProxy(object):
 
         request = self._build_request_message(None, [batch_item])
         response = self._send_and_receive_message(request)
-        results = self._process_batch_items(response)
+        results = self._process_batch_items(request, response)
         return results[0]
 
     def revoke(self, revocation_reason, uuid=None, revocation_message=None,
@@ -809,7 +811,7 @@ class KMIPProxy(object):
         else:
             request = self._build_request_message(credential, [batch_item])
             response = self._send_and_receive_message(request)
-            results = self._process_batch_items(response)
+            results = self._process_batch_items(request, response)
             return results[0]
 
     def locate(self, maximum_items=None, storage_status_mask=None,
@@ -843,7 +845,7 @@ class KMIPProxy(object):
         else:
             request = self._build_request_message(credential, [batch_item])
             response = self._send_and_receive_message(request)
-            results = self._process_batch_items(response)
+            results = self._process_batch_items(request, response)
             return results[0]
 
     def discover_versions(self, batch=False, protocol_versions=None,
@@ -856,7 +858,7 @@ class KMIPProxy(object):
         else:
             request = self._build_request_message(credential, [batch_item])
             response = self._send_and_receive_message(request)
-            results = self._process_batch_items(response)
+            results = self._process_batch_items(request, response)
             return results[0]
 
     def encrypt(self,
@@ -915,7 +917,9 @@ class KMIPProxy(object):
 
         request = self._build_request_message(credential, [batch_item])
         response = self._send_and_receive_message(request)
-        batch_item = response.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request, response
+        )
         payload = batch_item.response_payload
 
         result = {}
@@ -991,7 +995,9 @@ class KMIPProxy(object):
 
         request = self._build_request_message(credential, [batch_item])
         response = self._send_and_receive_message(request)
-        batch_item = response.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request, response
+        )
         payload = batch_item.response_payload
 
         result = {}
@@ -1066,7 +1072,9 @@ class KMIPProxy(object):
 
         request = self._build_request_message(credential, [batch_item])
         response = self._send_and_receive_message(request)
-        batch_item = response.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request, response
+        )
         payload = batch_item.response_payload
 
         result = {}
@@ -1133,7 +1141,9 @@ class KMIPProxy(object):
 
         request = self._build_request_message(credential, [batch_item])
         response = self._send_and_receive_message(request)
-        batch_item = response.batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request, response
+        )
         payload = batch_item.response_payload
 
         result = {}
@@ -1176,13 +1186,14 @@ class KMIPProxy(object):
         batch_item = messages.RequestBatchItem(operation=operation,
                                                request_payload=req_pl)
 
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:
@@ -1269,16 +1280,246 @@ class KMIPProxy(object):
             operation=operation, request_payload=payload)
         return batch_item
 
-    def _process_batch_items(self, response):
+    def _process_batch_items(self, request, response):
+        """
+        Build high-level operation results from a batch response, first
+        verifying that every response batch item can be traced back to the
+        request batch item it answers.
+
+        Response items are never trusted positionally. Their unique batch
+        item IDs (when the request used them) and operations are checked
+        against the request before any result object is constructed. Short
+        responses are allowed only when the request asked the server to stop
+        the batch on the first failure; any other missing item is an invalid
+        message.
+
+        Args:
+            request (RequestMessage): The request message sent to the server.
+            response (ResponseMessage): The response message received from
+                the server.
+
+        Returns:
+            list: A list of OperationResult objects, one for each response
+                batch item that passed validation.
+
+        Raises:
+            InvalidMessage: if the response cannot be unambiguously matched
+                to the request (unknown or duplicated batch item IDs,
+                mismatched operations, unexpected missing items, or result
+                statuses that violate the KMIP payload requirements).
+        """
+        request_items = request.batch_items
+        response_items = response.batch_items
+
+        self._validate_batch_response(request, response)
+
+        batch_order = False
+        if request.request_header.batch_order_option is not None:
+            batch_order = request.request_header.batch_order_option.value
+
+        if batch_order:
+            matched_items = [
+                (request_items[index], response_item)
+                for index, response_item in enumerate(response_items)
+            ]
+        else:
+            matched_items = self._match_response_batch_items(
+                request_items, response_items)
+
         results = []
-        for batch_item in response.batch_items:
-            operation = None
-            if batch_item.operation is not None:
-                operation = batch_item.operation.value
+        for request_item, response_item in matched_items:
+            operation = request_item.operation.value
             processor = self._get_batch_item_processor(operation)
-            result = processor(batch_item)
+            result = processor(response_item)
             results.append(result)
         return results
+
+    def _validate_single_batch_response(self, request, response):
+        """
+        Verify that a single-item response answers the given single-item
+        request, then return the validated response batch item.
+
+        Args:
+            request (RequestMessage): The request message sent to the server.
+            response (ResponseMessage): The response message received from
+                the server.
+
+        Returns:
+            ResponseBatchItem: The validated response batch item.
+
+        Raises:
+            InvalidMessage: if the response does not contain exactly one
+                batch item that can be matched to the request and satisfies
+                the status/payload requirements.
+        """
+        if len(response.batch_items) != 1:
+            raise exceptions.InvalidMessage(
+                "The response message does not have the right number of "
+                "requested operation results."
+            )
+
+        self._validate_batch_response(request, response)
+        return response.batch_items[0]
+
+    def _validate_batch_response(self, request, response):
+        request_items = request.batch_items
+        response_items = response.batch_items
+
+        if len(response_items) > len(request_items):
+            raise exceptions.InvalidMessage(
+                "The response message contains {0} batch item(s) but only "
+                "{1} were requested.".format(
+                    len(response_items), len(request_items))
+            )
+
+        request_ids = [
+            item.unique_batch_item_id.value
+            if item.unique_batch_item_id is not None else None
+            for item in request_items
+        ]
+        request_uses_ids = any(identifier is not None
+                               for identifier in request_ids)
+
+        seen_ids = set()
+        for index, response_item in enumerate(response_items):
+            response_id = None
+            if response_item.unique_batch_item_id is not None:
+                response_id = response_item.unique_batch_item_id.value
+
+            if request_uses_ids:
+                if response_id is None:
+                    raise exceptions.InvalidMessage(
+                        "The response batch item at position {0} is missing "
+                        "its unique batch item ID.".format(index)
+                    )
+                if response_id not in request_ids:
+                    raise exceptions.InvalidMessage(
+                        "The response batch item at position {0} references "
+                        "an unknown unique batch item ID.".format(index)
+                    )
+                if response_id in seen_ids:
+                    raise exceptions.InvalidMessage(
+                        "The unique batch item ID of the response batch item "
+                        "at position {0} is duplicated.".format(index)
+                    )
+                seen_ids.add(response_id)
+                request_item = request_items[request_ids.index(response_id)]
+            else:
+                if index >= len(request_items):
+                    raise exceptions.InvalidMessage(
+                        "The response batch item at position {0} has no "
+                        "corresponding request batch item.".format(index)
+                    )
+                request_item = request_items[index]
+
+            self._validate_batch_item(request_item, response_item, index)
+
+        if len(response_items) < len(request_items):
+            self._validate_short_batch_response(request, response_items)
+
+    def _validate_batch_item(self, request_item, response_item, index):
+        if response_item.result_status is None:
+            raise exceptions.InvalidMessage(
+                "The response batch item at position {0} is missing its "
+                "result status.".format(index)
+            )
+
+        status = response_item.result_status.value
+        request_operation = request_item.operation.value
+
+        if response_item.operation is not None:
+            response_operation = response_item.operation.value
+            if response_operation != request_operation:
+                raise exceptions.InvalidMessage(
+                    "The response batch item at position {0} reports "
+                    "operation {1} but the request batch item requested "
+                    "operation {2}.".format(
+                        index, response_operation, request_operation)
+                )
+
+        if status == enums.ResultStatus.SUCCESS:
+            if response_item.operation is None:
+                raise exceptions.InvalidMessage(
+                    "The successful response batch item at position {0} is "
+                    "missing its operation.".format(index)
+                )
+            if response_item.response_payload is None:
+                raise exceptions.InvalidMessage(
+                    "The successful response batch item at position {0} is "
+                    "missing its response payload.".format(index)
+                )
+        elif status in (enums.ResultStatus.OPERATION_FAILED,
+                        enums.ResultStatus.OPERATION_UNDONE):
+            if response_item.result_reason is None:
+                raise exceptions.InvalidMessage(
+                    "The failed response batch item at position {0} is "
+                    "missing its result reason.".format(index)
+                )
+            if response_item.response_payload is not None:
+                raise exceptions.InvalidMessage(
+                    "The failed response batch item at position {0} must not "
+                    "carry a response payload.".format(index)
+                )
+        elif status == enums.ResultStatus.OPERATION_PENDING:
+            if response_item.operation is None:
+                raise exceptions.InvalidMessage(
+                    "The pending response batch item at position {0} is "
+                    "missing its operation.".format(index)
+                )
+
+    def _validate_short_batch_response(self, request, response_items):
+        stop_on_error = False
+        option = request.request_header.batch_error_cont_option
+        if option is not None:
+            stop_on_error = (
+                option.value ==
+                enums.BatchErrorContinuationOption.STOP
+            )
+
+        if not stop_on_error or not response_items:
+            raise exceptions.InvalidMessage(
+                "The response message is missing {0} of the {1} requested "
+                "batch item result(s).".format(
+                    len(request.batch_items) - len(response_items),
+                    len(request.batch_items))
+            )
+
+        last_item = response_items[-1]
+        last_status = last_item.result_status
+        if last_status is None or \
+                last_status.value == enums.ResultStatus.SUCCESS:
+            raise exceptions.InvalidMessage(
+                "The response message is missing batch item results even "
+                "though the last returned result was not a failure."
+            )
+
+    def _match_response_batch_items(self, request_items, response_items):
+        request_ids = [
+            item.unique_batch_item_id.value
+            if item.unique_batch_item_id is not None else None
+            for item in request_items
+        ]
+        request_uses_ids = any(identifier is not None
+                               for identifier in request_ids)
+
+        matched_items = []
+        if request_uses_ids:
+            # Pair each request item with its response so that results are
+            # returned in request order regardless of the response order.
+            responses_by_id = {}
+            for response_item in response_items:
+                response_id = response_item.unique_batch_item_id.value
+                responses_by_id[response_id] = response_item
+            for index, request_item in enumerate(request_items):
+                response_item = responses_by_id.get(request_ids[index])
+                if response_item is not None:
+                    matched_items.append((request_item, response_item))
+        else:
+            for index, response_item in enumerate(response_items):
+                matched_items.append(
+                    (request_items[index], response_item)
+                )
+        return matched_items
 
     def _get_batch_item_processor(self, operation):
         if operation is None:
@@ -1296,8 +1537,10 @@ class KMIPProxy(object):
         elif operation == OperationEnum.DISCOVER_VERSIONS:
             return self._process_discover_versions_batch_item
         else:
-            raise ValueError("no processor for operation: {0}".format(
-                operation))
+            # The response batch item has already been validated against the
+            # request, so a generic result is safe for operations without a
+            # dedicated processor.
+            return self._process_response_error
 
     def _process_get_attributes_batch_item(self, batch_item):
         payload = batch_item.response_payload
@@ -1428,13 +1671,14 @@ class KMIPProxy(object):
 
         batch_item = messages.RequestBatchItem(operation=operation,
                                                request_payload=req_pl)
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:
@@ -1465,13 +1709,14 @@ class KMIPProxy(object):
 
         batch_item = messages.RequestBatchItem(operation=operation,
                                                request_payload=payload)
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:
@@ -1498,13 +1743,14 @@ class KMIPProxy(object):
 
         batch_item = messages.RequestBatchItem(operation=operation,
                                                request_payload=payload)
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:
@@ -1536,13 +1782,14 @@ class KMIPProxy(object):
 
         batch_item = messages.RequestBatchItem(operation=operation,
                                                request_payload=payload)
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:
@@ -1573,13 +1820,14 @@ class KMIPProxy(object):
         batch_item = messages.RequestBatchItem(operation=operation,
                                                request_payload=req_pl)
 
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:
@@ -1615,14 +1863,15 @@ class KMIPProxy(object):
             request_payload=payload
         )
 
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
 
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:
@@ -1650,13 +1899,14 @@ class KMIPProxy(object):
         batch_item = messages.RequestBatchItem(operation=operation,
                                                request_payload=req_pl)
 
-        message = self._build_request_message(credential, [batch_item])
-        self._send_message(message)
+        request_message = self._build_request_message(
+            credential, [batch_item])
+        self._send_message(request_message)
         message = messages.ResponseMessage()
         data = self._receive_message()
         message.read(data, self.kmip_version)
-        batch_items = message.batch_items
-        batch_item = batch_items[0]
+        batch_item = self._validate_single_batch_response(
+            request_message, message)
         payload = batch_item.response_payload
 
         if payload is None:

@@ -15,6 +15,7 @@
 
 from testtools import TestCase
 
+from kmip.core import attributes as attr
 from kmip.core.attributes import CryptographicParameters
 from kmip.core.attributes import DerivationParameters
 from kmip.core.attributes import PrivateKeyUniqueIdentifier
@@ -37,13 +38,21 @@ from kmip.core.factories.credentials import CredentialFactory
 from kmip.core.factories.secrets import SecretFactory
 
 from kmip.core.messages.messages import RequestBatchItem
+from kmip.core.messages.messages import RequestHeader
+from kmip.core.messages.messages import RequestMessage
 from kmip.core.messages.messages import ResponseBatchItem
+from kmip.core.messages.messages import ResponseHeader
 from kmip.core.messages.messages import ResponseMessage
+from kmip.core.messages.contents import BatchCount
+from kmip.core.messages.contents import BatchErrorContinuationOption
+from kmip.core.messages.contents import BatchOrderOption
 from kmip.core.messages.contents import Operation
 from kmip.core.messages.contents import ResultStatus
 from kmip.core.messages.contents import ResultReason
 from kmip.core.messages.contents import ResultMessage
 from kmip.core.messages.contents import ProtocolVersion
+from kmip.core.messages.contents import TimeStamp
+from kmip.core.messages.contents import UniqueBatchItemID
 from kmip.core.messages import payloads
 
 from kmip.core.misc import Offset
@@ -55,6 +64,8 @@ from kmip.core.objects import CommonTemplateAttribute
 from kmip.core.objects import PrivateKeyTemplateAttribute
 from kmip.core.objects import PublicKeyTemplateAttribute
 from kmip.core import primitives
+
+from kmip.core.utils import BytearrayStream
 
 from kmip.services.kmip_client import KMIPProxy
 
@@ -95,6 +106,61 @@ class TestKMIPClient(TestCase):
 
     def tearDown(self):
         super(TestKMIPClient, self).tearDown()
+
+    def _build_request_message(
+            self,
+            batch_items,
+            batch_error_cont_option=None,
+            batch_order_option=None):
+        header = RequestHeader(
+            protocol_version=ProtocolVersion(1, 2),
+            batch_error_cont_option=batch_error_cont_option,
+            batch_order_option=batch_order_option,
+            batch_count=BatchCount(len(batch_items))
+        )
+        return RequestMessage(
+            request_header=header,
+            batch_items=batch_items
+        )
+
+    def _build_request_message_for_mock(self, credential, batch_items):
+        return self._build_request_message(batch_items)
+
+    def _build_request_batch_item(self, operation, batch_item_id=None):
+        unique_batch_item_id = None
+        if batch_item_id is not None:
+            unique_batch_item_id = UniqueBatchItemID(batch_item_id)
+        return RequestBatchItem(
+            operation=Operation(operation),
+            unique_batch_item_id=unique_batch_item_id,
+            request_payload=payloads.RequestPayload()
+        )
+
+    def _build_response_batch_item(
+            self,
+            operation,
+            result_status=ResultStatusEnum.SUCCESS,
+            result_reason=None,
+            result_message=None,
+            response_payload=None,
+            batch_item_id=None):
+        unique_batch_item_id = None
+        if batch_item_id is not None:
+            unique_batch_item_id = UniqueBatchItemID(batch_item_id)
+        reason = None
+        if result_reason is not None:
+            reason = ResultReason(result_reason)
+        message = None
+        if result_message is not None:
+            message = ResultMessage(result_message)
+        return ResponseBatchItem(
+            operation=Operation(operation) if operation is not None else None,
+            unique_batch_item_id=unique_batch_item_id,
+            result_status=ResultStatus(result_status),
+            result_reason=reason,
+            result_message=message,
+            response_payload=response_payload
+        )
 
     def test_kmip_version_get(self):
         """
@@ -475,9 +541,14 @@ class TestKMIPClient(TestCase):
     def test_process_batch_items(self):
         batch_item = ResponseBatchItem(
             operation=Operation(OperationEnum.CREATE_KEY_PAIR),
+            result_status=ResultStatus(ResultStatusEnum.SUCCESS),
             response_payload=payloads.CreateKeyPairResponsePayload())
         response = ResponseMessage(batch_items=[batch_item, batch_item])
-        results = self.client._process_batch_items(response)
+        request = self._build_request_message([
+            self._build_request_batch_item(OperationEnum.CREATE_KEY_PAIR),
+            self._build_request_batch_item(OperationEnum.CREATE_KEY_PAIR)
+        ])
+        results = self.client._process_batch_items(request, response)
 
         base = "expected {0}, received {1}"
         msg = base.format(list, results)
@@ -492,14 +563,16 @@ class TestKMIPClient(TestCase):
 
     def test_process_batch_items_no_batch_items(self):
         response = ResponseMessage(batch_items=[])
-        results = self.client._process_batch_items(response)
-
-        base = "expected {0}, received {1}"
-        msg = base.format(list, results)
-        self.assertIsInstance(results, list, msg)
-
-        msg = "number of results " + base.format(0, len(results))
-        self.assertEqual(0, len(results), msg)
+        request = self._build_request_message([
+            self._build_request_batch_item(OperationEnum.CREATE_KEY_PAIR)
+        ])
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "missing 1 of the 1 requested batch item result",
+            self.client._process_batch_items,
+            request,
+            response
+        )
 
     def test_process_batch_item_with_error(self):
         result_status = ResultStatus(ResultStatusEnum.OPERATION_FAILED)
@@ -511,7 +584,10 @@ class TestKMIPClient(TestCase):
             result_reason=result_reason,
             result_message=result_message)
         response = ResponseMessage(batch_items=[batch_item])
-        results = self.client._process_batch_items(response)
+        request = self._build_request_message([
+            self._build_request_batch_item(OperationEnum.CREATE_KEY_PAIR)
+        ])
+        results = self.client._process_batch_items(request, response)
 
         base = "expected {0}, received {1}"
         msg = "number of results " + base.format(1, len(results))
@@ -531,20 +607,22 @@ class TestKMIPClient(TestCase):
             OperationEnum.CREATE_KEY_PAIR)
         msg = base.format(expected, observed)
         self.assertEqual(expected, observed, msg)
-
         expected = self.client._process_rekey_key_pair_batch_item
         observed = self.client._get_batch_item_processor(
             OperationEnum.REKEY_KEY_PAIR)
         msg = base.format(expected, observed)
         self.assertEqual(expected, observed, msg)
 
-        self.assertRaisesRegex(
-            ValueError,
-            "no processor for operation",
-            self.client._get_batch_item_processor,
-            0xA5A5A5A5
-        )
+        expected = self.client._process_response_error
+        observed = self.client._get_batch_item_processor(
+            OperationEnum.CREATE)
+        msg = base.format(expected, observed)
+        self.assertEqual(expected, observed, msg)
 
+        expected = self.client._process_response_error
+        observed = self.client._get_batch_item_processor(0xA5A5A5A5)
+        msg = base.format(expected, observed)
+        self.assertEqual(expected, observed, msg)
         expected = self.client._process_get_attributes_batch_item
         observed = self.client._get_batch_item_processor(
             OperationEnum.GET_ATTRIBUTES
@@ -802,7 +880,7 @@ class TestKMIPClient(TestCase):
         )
         response_message = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response_message
 
         result = self.client.send_request_payload(
@@ -882,7 +960,7 @@ class TestKMIPClient(TestCase):
         Test that an InvalidMessage error is raised when the wrong number of
         response payloads are returned from the server.
         """
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = ResponseMessage(batch_items=[])
 
         args = (
@@ -927,7 +1005,7 @@ class TestKMIPClient(TestCase):
             result_status=ResultStatus(ResultStatusEnum.SUCCESS),
             response_payload=response_payload
         )
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = ResponseMessage(batch_items=[batch_item])
 
         args = (
@@ -941,7 +1019,8 @@ class TestKMIPClient(TestCase):
 
         self.assertRaisesRegex(
             exceptions.InvalidMessage,
-            "The response message does not match the request operation.",
+            "reports operation Operation.CREATE but the request batch item "
+            "requested operation Operation.DELETE_ATTRIBUTE",
             self.client.send_request_payload,
             *args
         )
@@ -970,7 +1049,7 @@ class TestKMIPClient(TestCase):
             result_status=ResultStatus(ResultStatusEnum.SUCCESS),
             response_payload=response_payload
         )
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = ResponseMessage(batch_items=[batch_item])
 
         args = (
@@ -1064,7 +1143,7 @@ class TestKMIPClient(TestCase):
             result_reason=ResultReason(ResultReasonEnum.GENERAL_FAILURE),
             result_message=ResultMessage("Test failed!")
         )
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = ResponseMessage(batch_items=[batch_item])
 
         args = (
@@ -1107,7 +1186,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.check(
@@ -1181,7 +1260,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.rekey(
@@ -1253,7 +1332,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.rekey(
@@ -1302,7 +1381,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.derive_key(
@@ -1366,7 +1445,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.encrypt(
@@ -1429,7 +1508,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.decrypt(
@@ -1486,7 +1565,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.signature_verify(
@@ -1540,7 +1619,7 @@ class TestKMIPClient(TestCase):
         )
         response = ResponseMessage(batch_items=[batch_item])
 
-        build_mock.return_value = None
+        build_mock.side_effect = self._build_request_message_for_mock
         send_mock.return_value = response
 
         result = self.client.sign(
@@ -1601,15 +1680,17 @@ class TestKMIPClient(TestCase):
             b'\xef\x79\xa4\xbe\x05\x3b\x31\x49\x19\xe0\x75\x23\xb9\xbe\xc8\x23'
             b'\x35\x60\x7e\x49\xba\xa9\x7e\xe0\x9e\x6b\x3d\x55\xf4\x51\xff\x7c'
         )
-        response_no_payload = (
-            b'\x42\x00\x7b\x01\x00\x00\x00\x78\x42\x00\x7a\x01\x00\x00\x00\x48'
+        response_failure = (
+            b'\x42\x00\x7b\x01\x00\x00\x00\x98\x42\x00\x7a\x01\x00\x00\x00\x48'
             b'\x42\x00\x69\x01\x00\x00\x00\x20\x42\x00\x6a\x02\x00\x00\x00\x04'
             b'\x00\x00\x00\x01\x00\x00\x00\x00\x42\x00\x6b\x02\x00\x00\x00\x04'
             b'\x00\x00\x00\x02\x00\x00\x00\x00\x42\x00\x92\x09\x00\x00\x00\x08'
-            b'\x00\x00\x00\x00\x58\x8a\x3f\x23\x42\x00\x0d\x02\x00\x00\x00\x04'
-            b'\x00\x00\x00\x01\x00\x00\x00\x00\x42\x00\x0f\x01\x00\x00\x00\x80'
+            b'\x00\x00\x00\x00\x00\x00\x00\x00\x42\x00\x0d\x02\x00\x00\x00\x04'
+            b'\x00\x00\x00\x01\x00\x00\x00\x00\x42\x00\x0f\x01\x00\x00\x00\x40'
             b'\x42\x00\x5c\x05\x00\x00\x00\x04\x00\x00\x00\x23\x00\x00\x00\x00'
-            b'\x42\x00\x7f\x05\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00'
+            b'\x42\x00\x7f\x05\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x00'
+            b'\x42\x00\x7e\x05\x00\x00\x00\x04\x00\x00\x01\x00\x00\x00\x00\x00'
+            b'\x42\x00\x7d\x07\x00\x00\x00\x07\x66\x61\x69\x6c\x75\x72\x65\x00'
         )
 
         data = (b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B'
@@ -1643,11 +1724,15 @@ class TestKMIPClient(TestCase):
         self.assertEqual(result.mac_data.value, mdata)
 
         self.client._receive_message.return_value = \
-            BytearrayStream(response_no_payload)
+            BytearrayStream(response_failure)
 
         result = self.client.mac(data, uuid, cryptographic_parameters)
         self.assertEqual(result.uuid, None)
         self.assertEqual(result.mac_data, None)
+        self.assertEqual(
+            ResultStatusEnum.OPERATION_FAILED,
+            result.result_status.value
+        )
 
 
 class TestClientProfileInformation(TestCase):
@@ -1760,3 +1845,563 @@ class TestClientProfileInformation(TestCase):
             ConformanceClause.BASELINE,
             AuthenticationSuite.TLS12)
         self.assertFalse(supported)
+
+
+class TestBatchResponseValidation(TestCase):
+    """
+    A test suite covering the request/response association checks the client
+    runs before constructing high-level operation result objects.
+    """
+
+    def setUp(self):
+        super(TestBatchResponseValidation, self).setUp()
+        self.client = KMIPProxy(config_file="/dev/null")
+
+        self.stop = BatchErrorContinuationOption(
+            enums.BatchErrorContinuationOption.STOP
+        )
+        self.continue_option = BatchErrorContinuationOption(
+            enums.BatchErrorContinuationOption.CONTINUE
+        )
+        self.ordered = BatchOrderOption(True)
+        self.unordered = BatchOrderOption(False)
+
+    def _request(self, operations, ids=None, cont_option=None, order=None):
+        batch_items = []
+        for index, operation in enumerate(operations):
+            batch_item_id = None
+            if ids is not None:
+                batch_item_id = ids[index]
+            batch_items.append(
+                self._request_item(operation, batch_item_id)
+            )
+        header = RequestHeader(
+            protocol_version=ProtocolVersion(1, 2),
+            batch_error_cont_option=cont_option,
+            batch_order_option=order,
+            batch_count=BatchCount(len(batch_items))
+        )
+        return RequestMessage(request_header=header, batch_items=batch_items)
+
+    @staticmethod
+    def _request_item(operation, batch_item_id=None):
+        unique_batch_item_id = None
+        if batch_item_id is not None:
+            unique_batch_item_id = UniqueBatchItemID(batch_item_id)
+        return RequestBatchItem(
+            operation=Operation(operation),
+            unique_batch_item_id=unique_batch_item_id,
+            request_payload=payloads.RequestPayload()
+        )
+
+    @staticmethod
+    def _response_item(operation, status=ResultStatusEnum.SUCCESS,
+                       reason=None, message=None, response_payload=None,
+                       batch_item_id=None):
+        unique_batch_item_id = None
+        if batch_item_id is not None:
+            unique_batch_item_id = UniqueBatchItemID(batch_item_id)
+        result_reason = ResultReason(reason) if reason is not None else None
+        result_message = ResultMessage(message) if message else None
+        return ResponseBatchItem(
+            operation=Operation(operation) if operation is not None else None,
+            unique_batch_item_id=unique_batch_item_id,
+            result_status=ResultStatus(status),
+            result_reason=result_reason,
+            result_message=result_message,
+            response_payload=response_payload
+        )
+
+    @staticmethod
+    def _failure(operation, batch_item_id=None,
+                 reason=ResultReasonEnum.GENERAL_FAILURE):
+        return TestBatchResponseValidation._response_item(
+            operation,
+            status=ResultStatusEnum.OPERATION_FAILED,
+            reason=reason,
+            message="failure",
+            response_payload=None,
+            batch_item_id=batch_item_id
+        )
+
+    def test_valid_ordered_response_matches_by_position(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            order=self.ordered
+        )
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            ),
+            self._response_item(
+                OperationEnum.ACTIVATE,
+                response_payload=payloads.ActivateResponsePayload(
+                    unique_identifier=attr.UniqueIdentifier("1")
+                )
+            )
+        ])
+
+        results = self.client._process_batch_items(request, response)
+
+        self.assertEqual(2, len(results))
+        for result in results:
+            self.assertIsInstance(result, OperationResult)
+            self.assertEqual(
+                enums.ResultStatus.SUCCESS,
+                result.result_status.value
+            )
+
+    def test_response_with_wrong_operation_is_rejected(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            order=self.ordered
+        )
+        # The server reordered the answers but the client must not accept
+        # positional interpretation: position 0 carries an Activate answer.
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.ACTIVATE,
+                response_payload=payloads.ActivateResponsePayload(
+                    unique_identifier=attr.UniqueIdentifier("1")
+                )
+            ),
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "reports operation Operation.ACTIVATE but the request batch item "
+            "requested operation Operation.CREATE",
+            self.client._process_batch_items,
+            request,
+            response
+        )
+
+    def test_unordered_response_is_matched_by_batch_item_id(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            ids=[b"id-1", b"id-2"],
+            order=self.unordered
+        )
+        # Responses arrive out of order but carry the correct batch item
+        # IDs. The Activate answer (id-2) is a failure while the Create
+        # answer (id-1) succeeded, so result order proves the matching.
+        response = ResponseMessage(batch_items=[
+            self._failure(OperationEnum.ACTIVATE, batch_item_id=b"id-2"),
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                ),
+                batch_item_id=b"id-1"
+            )
+        ])
+
+        results = self.client._process_batch_items(request, response)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            results[0].result_status.value
+        )
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            results[1].result_status.value
+        )
+
+    def test_unknown_batch_item_id_is_rejected(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            ids=[b"id-1", b"id-2"],
+            order=self.unordered
+        )
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                ),
+                batch_item_id=b"unknown"
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "references an unknown unique batch item ID",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_duplicate_batch_item_id_is_rejected(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            ids=[b"id-1", b"id-2"],
+            order=self.unordered
+        )
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                ),
+                batch_item_id=b"id-1"
+            ),
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="2"
+                ),
+                batch_item_id=b"id-1"
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "is duplicated",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_missing_batch_item_id_is_rejected(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            ids=[b"id-1", b"id-2"],
+            order=self.unordered
+        )
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "is missing its unique batch item ID",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_short_response_with_stop_option_is_accepted(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            cont_option=self.stop,
+            order=self.ordered
+        )
+        # The server stopped the batch on the first failure and is allowed to
+        # return only one result under the STOP error continuation option.
+        response = ResponseMessage(batch_items=[
+            self._failure(OperationEnum.CREATE)
+        ])
+
+        results = self.client._process_batch_items(request, response)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual(
+            enums.ResultStatus.OPERATION_FAILED,
+            results[0].result_status.value
+        )
+
+    def test_short_response_with_continue_option_is_rejected(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            cont_option=self.continue_option,
+            order=self.ordered
+        )
+        response = ResponseMessage(batch_items=[
+            self._failure(OperationEnum.CREATE)
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "missing 1 of the 2 requested batch item result",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_short_response_ending_in_success_is_rejected(self):
+        request = self._request(
+            [OperationEnum.CREATE, OperationEnum.ACTIVATE],
+            cont_option=self.stop,
+            order=self.ordered
+        )
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "missing batch item results even though the last returned "
+            "result was not a failure",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_empty_response_is_rejected(self):
+        request = self._request(
+            [OperationEnum.CREATE],
+            cont_option=self.stop,
+            order=self.ordered
+        )
+        response = ResponseMessage(batch_items=[])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "missing 1 of the 1 requested batch item result",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_response_with_too_many_items_is_rejected(self):
+        request = self._request([OperationEnum.CREATE], order=self.ordered)
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            ),
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="2"
+                )
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "contains 2 batch item.s. but only 1 were requested",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_success_without_payload_is_rejected(self):
+        request = self._request([OperationEnum.CREATE], order=self.ordered)
+        response = ResponseMessage(batch_items=[
+            self._response_item(OperationEnum.CREATE, response_payload=None)
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "successful response batch item at position 0 is missing its "
+            "response payload",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_success_without_operation_is_rejected(self):
+        request = self._request([OperationEnum.CREATE], order=self.ordered)
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                None,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "successful response batch item at position 0 is missing its "
+            "operation",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_failure_without_reason_is_rejected(self):
+        request = self._request([OperationEnum.CREATE], order=self.ordered)
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                status=ResultStatusEnum.OPERATION_FAILED,
+                reason=None
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "failed response batch item at position 0 is missing its result "
+            "reason",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_failure_with_payload_is_rejected(self):
+        request = self._request([OperationEnum.CREATE], order=self.ordered)
+        response = ResponseMessage(batch_items=[
+            self._response_item(
+                OperationEnum.CREATE,
+                status=ResultStatusEnum.OPERATION_FAILED,
+                reason=ResultReasonEnum.GENERAL_FAILURE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "failed response batch item at position 0 must not carry a "
+            "response payload",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def test_missing_result_status_is_rejected(self):
+        request = self._request([OperationEnum.CREATE], order=self.ordered)
+        response = ResponseMessage(batch_items=[
+            ResponseBatchItem(
+                operation=Operation(OperationEnum.CREATE),
+                result_status=None,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="1"
+                )
+            )
+        ])
+
+        self.assertRaisesRegex(
+            exceptions.InvalidMessage,
+            "is missing its result status",
+            self.client._validate_batch_response,
+            request,
+            response
+        )
+
+    def _encode_response(self, batch_items):
+        response_message = ResponseMessage(
+            response_header=ResponseHeader(
+                protocol_version=ProtocolVersion(1, 2),
+                time_stamp=TimeStamp(0),
+                batch_count=BatchCount(len(batch_items))
+            ),
+            batch_items=batch_items
+        )
+        stream = BytearrayStream()
+        response_message.write(stream, enums.KMIPVersion.KMIP_1_2)
+        return BytearrayStream(stream.buffer)
+
+    def _mock_client_io(self, encoded_response):
+        self.client._send_message = mock.MagicMock()
+        self.client._receive_message = mock.MagicMock(
+            return_value=encoded_response
+        )
+
+    def test_create_rejects_encoded_activate_response(self):
+        """
+        Drive the client with an encoded response whose only batch item
+        answers an Activate request even though a Create was requested.
+        The client must refuse to treat the activated object as a newly
+        created key.
+        """
+        encoded = self._encode_response([
+            self._response_item(
+                OperationEnum.ACTIVATE,
+                response_payload=payloads.ActivateResponsePayload(
+                    unique_identifier=attr.UniqueIdentifier(
+                        "activated-key-uuid"
+                    )
+                )
+            )
+        ])
+        self._mock_client_io(encoded)
+
+        error = self.assertRaises(
+            exceptions.InvalidMessage,
+            self.client.create,
+            enums.ObjectType.SYMMETRIC_KEY,
+            None
+        )
+
+        # The error must locate the offending request item without leaking
+        # any key material or identifiers from the mismatched payload.
+        self.assertIn("position 0", str(error))
+        self.assertNotIn("activated-key-uuid", str(error))
+
+    def test_create_accepts_encoded_create_response(self):
+        """
+        Drive the client with a properly encoded Create response and verify
+        the new key UUID is returned.
+        """
+        encoded = self._encode_response([
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="new-key-uuid"
+                )
+            )
+        ])
+        self._mock_client_io(encoded)
+
+        result = self.client.create(enums.ObjectType.SYMMETRIC_KEY, None)
+
+        self.assertEqual(
+            enums.ResultStatus.SUCCESS,
+            result.result_status.value
+        )
+        self.assertEqual("new-key-uuid", result.uuid)
+
+    def test_activate_rejects_encoded_create_response(self):
+        """
+        The mirror scenario: an encoded Create result must not be consumed
+        as the answer to an Activate request.
+        """
+        encoded = self._encode_response([
+            self._response_item(
+                OperationEnum.CREATE,
+                response_payload=payloads.CreateResponsePayload(
+                    object_type=enums.ObjectType.SYMMETRIC_KEY,
+                    unique_identifier="created-key-uuid"
+                )
+            )
+        ])
+        self._mock_client_io(encoded)
+
+        error = self.assertRaises(
+            exceptions.InvalidMessage,
+            self.client.activate,
+            "some-uuid"
+        )
+
+        self.assertIn("position 0", str(error))
+        self.assertNotIn("created-key-uuid", str(error))

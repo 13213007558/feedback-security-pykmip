@@ -20,13 +20,16 @@ import testtools
 
 from kmip.core import attributes as attr
 from kmip.core import enums
+from kmip.core import exceptions
 from kmip.core import objects as obj
 
 from kmip.core.factories import attributes
 from kmip.core.messages import contents
+from kmip.core.messages import messages
 from kmip.core.messages import payloads
 from kmip.core import primitives
 from kmip.core.primitives import DateTime
+from kmip.core.utils import BytearrayStream
 
 from kmip.services.kmip_client import KMIPProxy
 from kmip.services import results
@@ -242,6 +245,76 @@ class TestProxyKmipClient(testtools.TestCase):
                 enums.ObjectType.SYMMETRIC_KEY, template)
             self.assertIsInstance(uid, str)
             self.assertEqual(uid, key_id)
+
+    def _encode_response(self, batch_items):
+        response_message = messages.ResponseMessage(
+            response_header=messages.ResponseHeader(
+                protocol_version=contents.ProtocolVersion(1, 2),
+                time_stamp=contents.TimeStamp(0),
+                batch_count=contents.BatchCount(len(batch_items))
+            ),
+            batch_items=batch_items
+        )
+        stream = BytearrayStream()
+        response_message.write(stream, enums.KMIPVersion.KMIP_1_2)
+        return BytearrayStream(stream.buffer)
+
+    def _open_client_with_encoded_response(self, encoded_response):
+        client = ProxyKmipClient()
+        client._is_open = True
+        client.proxy._send_message = mock.MagicMock()
+        client.proxy._receive_message = mock.MagicMock(
+            return_value=encoded_response
+        )
+        return client
+
+    def test_create_rejects_encoded_activate_response(self):
+        """
+        Test that the high-level client refuses to treat an encoded Activate
+        result as the answer to a Create request, instead of returning the
+        activated object's ID as a newly created key.
+        """
+        batch_item = messages.ResponseBatchItem(
+            operation=contents.Operation(enums.Operation.ACTIVATE),
+            result_status=contents.ResultStatus(enums.ResultStatus.SUCCESS),
+            response_payload=payloads.ActivateResponsePayload(
+                unique_identifier=attr.UniqueIdentifier("activated-key-uuid")
+            )
+        )
+        encoded = self._encode_response([batch_item])
+        client = self._open_client_with_encoded_response(encoded)
+
+        error = self.assertRaises(
+            exceptions.InvalidMessage,
+            client.create,
+            enums.CryptographicAlgorithm.AES,
+            256
+        )
+
+        # The error must locate the offending request item without leaking
+        # any key material or identifiers from the mismatched payload.
+        self.assertIn("position 0", str(error))
+        self.assertNotIn("activated-key-uuid", str(error))
+
+    def test_create_accepts_encoded_create_response(self):
+        """
+        Test that the high-level client returns the new key ID when driven
+        with a properly encoded Create response.
+        """
+        batch_item = messages.ResponseBatchItem(
+            operation=contents.Operation(enums.Operation.CREATE),
+            result_status=contents.ResultStatus(enums.ResultStatus.SUCCESS),
+            response_payload=payloads.CreateResponsePayload(
+                object_type=enums.ObjectType.SYMMETRIC_KEY,
+                unique_identifier="new-key-uuid"
+            )
+        )
+        encoded = self._encode_response([batch_item])
+        client = self._open_client_with_encoded_response(encoded)
+
+        uid = client.create(enums.CryptographicAlgorithm.AES, 256)
+
+        self.assertEqual("new-key-uuid", uid)
 
     @mock.patch('kmip.pie.client.KMIPProxy',
                 mock.MagicMock(spec_set=KMIPProxy))
