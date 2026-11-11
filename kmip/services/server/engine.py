@@ -2055,6 +2055,21 @@ class KmipEngine(object):
                     "mask for object {0} for it to be used in key "
                     "derivation.".format(unique_identifier)
                 )
+            elif managed_object.state not in (
+                enums.State.PRE_ACTIVE,
+                enums.State.ACTIVE
+            ):
+                # Per the KMIP usage/state tables, key derivation is only
+                # permitted from Pre-Active and Active material. Retired or
+                # compromised keys cannot produce new keying material.
+                raise exceptions.PermissionDenied(
+                    "Object {0} must be in the Pre-Active or Active state "
+                    "to be used for key derivation. It is currently in the "
+                    "{1} state.".format(
+                        unique_identifier,
+                        managed_object.state.name.title().replace('_', '-')
+                    )
+                )
             else:
                 existing_objects.append(managed_object)
 
@@ -2998,10 +3013,17 @@ class KmipEngine(object):
                 "Only symmetric decryption is currently supported."
             )
 
-        if managed_object.state != enums.State.ACTIVE:
+        # Per the KMIP usage/state tables, ciphertext produced before a key
+        # was retired can still be decrypted with a Deactivated or Compromised
+        # key. Pre-Active and destroyed keys cannot be used for decryption.
+        if managed_object.state not in (
+            enums.State.ACTIVE,
+            enums.State.DEACTIVATED,
+            enums.State.COMPROMISED
+        ):
             raise exceptions.PermissionDenied(
-                "The decryption key must be in the Active state to be used "
-                "for decryption."
+                "The decryption key must be in the Active, Deactivated, or "
+                "Compromised state to be used for decryption."
             )
 
         masks = managed_object.cryptographic_usage_masks
@@ -3062,10 +3084,17 @@ class KmipEngine(object):
                 "must be specified."
             )
 
-        if managed_object.state != enums.State.ACTIVE:
+        # Per the KMIP usage/state tables, an existing signature may be
+        # verified with a public key that is Active, Deactivated, or
+        # Compromised. Only Pre-Active and destroyed keys are unusable.
+        if managed_object.state not in (
+            enums.State.ACTIVE,
+            enums.State.DEACTIVATED,
+            enums.State.COMPROMISED
+        ):
             raise exceptions.PermissionDenied(
-                "The signing key must be in the Active state to be used for "
-                "signature verification."
+                "The signing key must be in the Active, Deactivated, or "
+                "Compromised state to be used for signature verification."
             )
 
         masks = managed_object.cryptographic_usage_masks

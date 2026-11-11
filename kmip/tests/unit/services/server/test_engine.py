@@ -10804,8 +10804,8 @@ class TestKmipEngine(testtools.TestCase):
         args = (payload,)
         self.assertRaisesRegex(
             exceptions.PermissionDenied,
-            "The decryption key must be in the Active state to be used "
-            "for decryption.",
+            "The decryption key must be in the Active, Deactivated, or "
+            "Compromised state to be used for decryption.",
             e._process_decrypt,
             *args
         )
@@ -11154,8 +11154,8 @@ class TestKmipEngine(testtools.TestCase):
         args = (payload,)
         self.assertRaisesRegex(
             exceptions.PermissionDenied,
-            "The signing key must be in the Active state to be used for "
-            "signature verification.",
+            "The signing key must be in the Active, Deactivated, or "
+            "Compromised state to be used for signature verification.",
             e._process_signature_verify,
             *args
         )
